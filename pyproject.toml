@@ -1,0 +1,17 @@
+[project]
+name = "skypoints-etl"
+version = "0.1.0"
+description = "Validated, scalable reference ETL for SkyPoints member and redemption feeds"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+skypoints-etl = "skypoints_etl.cli:main"
+skypoints-ingest = "skypoints_etl.ingest_cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
