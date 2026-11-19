@@ -128,6 +128,31 @@ def parse_source_date(value: Any) -> date | None:
 
 def _read_csv(path: Path) -> tuple[list[str], list[dict[str, str | None]]]:
     with path.open("r", encoding="utf-8-sig", newline="") as source:
+        first_line = source.readline()
+        source.seek(0)
+        if first_line.lstrip().startswith("|H|"):
+            header_parts = first_line.rstrip("\r\n").split("|")[2:]
+            if header_parts and header_parts[-1] == "":
+                header_parts.pop()
+            headers = [header.strip() for header in header_parts]
+            rows: list[dict[str, str | None]] = []
+            source.readline()  # consume the |H| line before iterating detail records
+            for line_number, line in enumerate(source, start=2):
+                if not line.strip():
+                    continue
+                parts = line.rstrip("\r\n").split("|")
+                record_type = parts[1] if len(parts) > 1 else ""
+                values = parts[2:]
+                if values and values[-1] == "":
+                    values.pop()
+                if record_type != "D":
+                    rows.append({"_PIPE_ERROR": f"expected D detail record, got {record_type!r}"})
+                elif len(values) != len(headers):
+                    rows.append({"_PIPE_ERROR": f"detail has {len(values)} fields; header declares {len(headers)}", "_PIPE_LINE": str(line_number)})
+                else:
+                    rows.append(dict(zip(headers, values)))
+            return headers, rows
+
         reader = csv.DictReader(source)
         if not reader.fieldnames:
             raise ValueError(f"{path.name}: CSV has no header row")
@@ -165,7 +190,14 @@ def _normalize_ind_corp(value: Any) -> str | None:
     if value is None or str(value).strip().upper() in NULL_VALUES:
         return None
     normalized = str(value).strip().upper()
-    values = {"I": "I", "IND": "I", "INDIVIDUAL": "I", "C": "C", "CORP": "C", "CORPORATE": "C"}
+    values = {
+        "I": "I",
+        "IND": "I",
+        "INDIVIDUAL": "I",
+        "C": "C",
+        "CORP": "C",
+        "CORPORATE": "C",
+    }
     if normalized not in values:
         raise ValueError(f"invalid IND_CORP value {value!r}; expected I or C")
     return values[normalized]
@@ -300,6 +332,8 @@ def ingest_csv_files(
         seen_ids: set[str] = set()
         for source_row_number, raw in enumerate(rows, start=2):
             try:
+                if raw.get("_PIPE_ERROR"):
+                    raise ValueError(str(raw["_PIPE_ERROR"]))
                 row = _normalize_row(raw, schema, country, ingest_date)
                 member_id = str(row["ID"])
                 if member_id in seen_ids:
@@ -390,23 +424,26 @@ def generate_snowflake_load_sql(result: IngestionResult, output_file: Path, data
     date_suffix = result.ingested_on.strftime("%Y%m%d")
     ingest_date = result.ingested_on.isoformat()
     batch_id = result.batch_id
+    countries = sorted(set(result.accepted_by_country) | {"USA", "IND", "AUS", "PHL"})
     statements = [
         f"CREATE SCHEMA IF NOT EXISTS {qualified_schema};",
         f"USE DATABASE \"{database.upper()}\";",
         f"USE SCHEMA \"{schema.upper()}\";",
-        "CREATE TABLE IF NOT EXISTS MEMBER_FILE_LANDING (BATCH_ID VARCHAR NOT NULL, COUNTRY_CODE VARCHAR(3) NOT NULL, SOURCE_FILE VARCHAR NOT NULL, SOURCE_ROW_NUMBER NUMBER NOT NULL, INGEST_DATE DATE NOT NULL, INGESTED_AT TIMESTAMP_NTZ NOT NULL, RAW_RECORD VARIANT NOT NULL, NORMALIZED_RECORD VARIANT NOT NULL, CONSTRAINT PK_MEMBER_FILE_LANDING PRIMARY KEY (BATCH_ID,COUNTRY_CODE,SOURCE_FILE,SOURCE_ROW_NUMBER) NOT ENFORCED);",
-        "CREATE TABLE IF NOT EXISTS MEMBER_FILE_STAGING (COUNTRY_CODE VARCHAR(3) NOT NULL, ID VARCHAR(18) NOT NULL, MEMBER_NAME VARCHAR(255) NOT NULL, DOB DATE, TIER_CODE CHAR(3), ENROLLMENT_DATE DATE NOT NULL, IND_CORP CHAR(1), FLIGHT_DATE DATE, AGENT_NAME VARCHAR(255), POST_CODE NUMBER(5,0), BATCH_ID VARCHAR NOT NULL, SOURCE_FILE VARCHAR NOT NULL, SOURCE_ROW_NUMBER NUMBER NOT NULL, INGEST_DATE DATE NOT NULL, INGESTED_AT TIMESTAMP_NTZ NOT NULL, AGE NUMBER(3,0), STALE_MEMBER BOOLEAN NOT NULL);",
+        "CREATE TABLE IF NOT EXISTS MEMBER_FILE_LANDING (BATCH_ID VARCHAR NOT NULL, COUNTRY_CODE VARCHAR(3) NOT NULL, SOURCE_FILE VARCHAR NOT NULL, SOURCE_ROW_NUMBER NUMBER NOT NULL, INGEST_DATE DATE NOT NULL, INGESTED_AT TIMESTAMP_NTZ NOT NULL, RAW_RECORD VARIANT NOT NULL, NORMALIZED_RECORD VARIANT NOT NULL, CONSTRAINT PK_MEMBER_FILE_LANDING PRIMARY KEY (BATCH_ID,COUNTRY_CODE,SOURCE_FILE,SOURCE_ROW_NUMBER) NOT ENFORCED) CLUSTER BY (BATCH_ID,COUNTRY_CODE);",
+        "CREATE TABLE IF NOT EXISTS MEMBER_FILE_STAGING (COUNTRY_CODE VARCHAR(3) NOT NULL, ID VARCHAR(18) NOT NULL, MEMBER_NAME VARCHAR(255) NOT NULL, DOB DATE, TIER_CODE CHAR(3), ENROLLMENT_DATE DATE NOT NULL, IND_CORP CHAR(1), FLIGHT_DATE DATE, AGENT_NAME VARCHAR(255), POST_CODE NUMBER(5,0), BATCH_ID VARCHAR NOT NULL, SOURCE_FILE VARCHAR NOT NULL, SOURCE_ROW_NUMBER NUMBER NOT NULL, INGEST_DATE DATE NOT NULL, INGESTED_AT TIMESTAMP_NTZ NOT NULL, AGE NUMBER(3,0), STALE_MEMBER BOOLEAN NOT NULL) CLUSTER BY (COUNTRY_CODE,BATCH_ID,ID);",
         "CREATE TABLE IF NOT EXISTS FILE_DQ_REJECT (BATCH_ID VARCHAR NOT NULL, COUNTRY_CODE VARCHAR(3) NOT NULL, SOURCE_FILE VARCHAR NOT NULL, SOURCE_ROW_NUMBER NUMBER NOT NULL, REASON_CODE VARCHAR NOT NULL, REASON_DETAIL VARCHAR NOT NULL, RAW_RECORD VARIANT NOT NULL, INGEST_DATE DATE NOT NULL, REJECTED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP());",
         "CREATE TABLE IF NOT EXISTS FILE_SCHEMA_AUDIT (BATCH_ID VARCHAR NOT NULL, COUNTRY_CODE VARCHAR(3) NOT NULL, SOURCE_FILE VARCHAR NOT NULL, SOURCE_SHA256 VARCHAR(64) NOT NULL, SOURCE_HEADERS VARIANT NOT NULL, COLUMN_MAPPING VARIANT NOT NULL, MISSING_STANDARD_COLUMNS VARIANT NOT NULL, EXTRA_SOURCE_COLUMNS VARIANT NOT NULL, ROWS_READ NUMBER NOT NULL, ROWS_ACCEPTED NUMBER NOT NULL, ROWS_REJECTED NUMBER NOT NULL, INSPECTED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP());",
         "CREATE TABLE IF NOT EXISTS ETL_BATCH_AUDIT (BATCH_ID VARCHAR NOT NULL, FEED_NAME VARCHAR NOT NULL, SOURCE_URI VARCHAR NOT NULL, CONTENT_SHA256 VARCHAR(64) NOT NULL, INGEST_DATE DATE NOT NULL, STATUS VARCHAR NOT NULL, SOURCE_FILE_COUNT NUMBER NOT NULL, STARTED_AT TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP(), COMPLETED_AT TIMESTAMP_NTZ, ROWS_READ NUMBER, ROWS_ACCEPTED NUMBER, ROWS_REJECTED NUMBER, ERROR_DETAIL VARCHAR, CONSTRAINT PK_ETL_BATCH_AUDIT PRIMARY KEY (BATCH_ID) NOT ENFORCED);",
+        "CREATE TABLE IF NOT EXISTS MEMBER_FILE_CURRENT_OWNER (ID VARCHAR(18) NOT NULL, COUNTRY_CODE VARCHAR(3) NOT NULL, LAST_BATCH_ID VARCHAR NOT NULL, UPDATED_AT TIMESTAMP_NTZ NOT NULL, CONSTRAINT PK_MEMBER_FILE_CURRENT_OWNER PRIMARY KEY (ID) NOT ENFORCED) CLUSTER BY (ID);",
+        "CREATE TABLE IF NOT EXISTS MEMBER_FILE_ID_CONFLICT (ID VARCHAR(18) NOT NULL, COUNTRY_CODES ARRAY NOT NULL, FIRST_SEEN_AT TIMESTAMP_NTZ NOT NULL DEFAULT CURRENT_TIMESTAMP(), CONSTRAINT PK_MEMBER_FILE_ID_CONFLICT PRIMARY KEY (ID) NOT ENFORCED) CLUSTER BY (ID);",
         "ALTER TABLE MEMBER_FILE_STAGING ADD COLUMN IF NOT EXISTS AGENT_NAME VARCHAR(255);",
         "ALTER TABLE MEMBER_FILE_STAGING ADD COLUMN IF NOT EXISTS POST_CODE NUMBER(5,0);",
         "ALTER TABLE FILE_SCHEMA_AUDIT ADD COLUMN IF NOT EXISTS SOURCE_SHA256 VARCHAR(64);",
     ]
-    for country in sorted(result.accepted_by_country):
+    for country in countries:
         table = f"MEMBER_{country}"
         statements.append(
-            f"CREATE TABLE IF NOT EXISTS {table} (ID VARCHAR(18) NOT NULL, MEMBER_NAME VARCHAR(255) NOT NULL, DOB DATE, TIER_CODE CHAR(3), ENROLLMENT_DATE DATE NOT NULL, IND_CORP CHAR(1), FLIGHT_DATE DATE, AGENT_NAME VARCHAR(255), POST_CODE NUMBER(5,0), INGEST_DATE DATE NOT NULL, SOURCE_FILE VARCHAR NOT NULL, SOURCE_ROW_NUMBER NUMBER NOT NULL, INGESTED_AT TIMESTAMP_NTZ NOT NULL, AGE NUMBER(3,0), STALE_MEMBER BOOLEAN NOT NULL, CONSTRAINT PK_{table} PRIMARY KEY (ID) NOT ENFORCED);"
+            f"CREATE TABLE IF NOT EXISTS {table} (ID VARCHAR(18) NOT NULL, MEMBER_NAME VARCHAR(255) NOT NULL, DOB DATE, TIER_CODE CHAR(3), ENROLLMENT_DATE DATE NOT NULL, IND_CORP CHAR(1), FLIGHT_DATE DATE, AGENT_NAME VARCHAR(255), POST_CODE NUMBER(5,0), INGEST_DATE DATE NOT NULL, SOURCE_FILE VARCHAR NOT NULL, SOURCE_ROW_NUMBER NUMBER NOT NULL, INGESTED_AT TIMESTAMP_NTZ NOT NULL, AGE NUMBER(3,0), STALE_MEMBER BOOLEAN NOT NULL, CONSTRAINT PK_{table} PRIMARY KEY (ID) NOT ENFORCED) CLUSTER BY (ID);"
         )
         statements.append(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS AGENT_NAME VARCHAR(255);")
         statements.append(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS POST_CODE NUMBER(5,0);")
@@ -446,6 +483,7 @@ def generate_snowflake_load_sql(result: IngestionResult, output_file: Path, data
             + ",".join(schema_values)
             + f" WHERE NOT EXISTS (SELECT 1 FROM FILE_SCHEMA_AUDIT WHERE BATCH_ID={_sql_string(batch_id)} AND SOURCE_FILE={_sql_string(file_result.source_file)});"
         )
+    country_merges: list[str] = []
     for country, rows in sorted(result.accepted_by_country.items()):
         table = f"MEMBER_{country}"
         landing_rows = []
@@ -489,11 +527,52 @@ def generate_snowflake_load_sql(result: IngestionResult, output_file: Path, data
             + ",".join(normalized_select)
             + f" FROM MEMBER_FILE_LANDING l WHERE l.BATCH_ID={_sql_string(batch_id)} AND l.COUNTRY_CODE='{country}' AND NOT EXISTS (SELECT 1 FROM MEMBER_FILE_STAGING s WHERE s.BATCH_ID=l.BATCH_ID AND s.COUNTRY_CODE=l.COUNTRY_CODE AND s.SOURCE_FILE=l.SOURCE_FILE AND s.SOURCE_ROW_NUMBER=l.SOURCE_ROW_NUMBER);"
         )
-        statements.append(
+        country_merges.append(
             f"MERGE INTO {table} t USING (SELECT * FROM MEMBER_FILE_STAGING WHERE COUNTRY_CODE='{country}' AND BATCH_ID={_sql_string(batch_id)} QUALIFY ROW_NUMBER() OVER(PARTITION BY ID ORDER BY INGESTED_AT DESC,SOURCE_FILE DESC,SOURCE_ROW_NUMBER DESC)=1) s ON t.ID=s.ID "
             "WHEN MATCHED AND s.INGESTED_AT>=t.INGESTED_AT THEN UPDATE SET "
             "MEMBER_NAME=s.MEMBER_NAME,DOB=s.DOB,TIER_CODE=s.TIER_CODE,ENROLLMENT_DATE=s.ENROLLMENT_DATE,IND_CORP=s.IND_CORP,FLIGHT_DATE=s.FLIGHT_DATE,AGENT_NAME=s.AGENT_NAME,POST_CODE=s.POST_CODE,INGEST_DATE=s.INGEST_DATE,SOURCE_FILE=s.SOURCE_FILE,SOURCE_ROW_NUMBER=s.SOURCE_ROW_NUMBER,INGESTED_AT=s.INGESTED_AT,AGE=s.AGE,STALE_MEMBER=s.STALE_MEMBER "
             "WHEN NOT MATCHED THEN INSERT (ID,MEMBER_NAME,DOB,TIER_CODE,ENROLLMENT_DATE,IND_CORP,FLIGHT_DATE,AGENT_NAME,POST_CODE,INGEST_DATE,SOURCE_FILE,SOURCE_ROW_NUMBER,INGESTED_AT,AGE,STALE_MEMBER) VALUES (s.ID,s.MEMBER_NAME,s.DOB,s.TIER_CODE,s.ENROLLMENT_DATE,s.IND_CORP,s.FLIGHT_DATE,s.AGENT_NAME,s.POST_CODE,s.INGEST_DATE,s.SOURCE_FILE,s.SOURCE_ROW_NUMBER,s.INGESTED_AT,s.AGE,s.STALE_MEMBER);"
+        )
+    # Establish legacy ownership only where exactly one country target contains an ID.
+    # IDs observed in multiple countries are permanently quarantined from auto-migration.
+    country_union = " UNION ALL ".join(
+        f"SELECT ID,'{country}' AS COUNTRY_CODE FROM MEMBER_{country}"
+        for country in countries
+    )
+    stage_union = " UNION ALL ".join(
+        f"SELECT ID,COUNTRY_CODE FROM MEMBER_FILE_STAGING WHERE BATCH_ID={_sql_string(batch_id)} AND COUNTRY_CODE='{country}'"
+        for country in sorted(result.accepted_by_country)
+    )
+    statements.extend([
+        "INSERT INTO MEMBER_FILE_ID_CONFLICT (ID,COUNTRY_CODES) "
+        f"SELECT ID,ARRAY_AGG(DISTINCT COUNTRY_CODE) FROM ({stage_union}) candidates "
+        "GROUP BY ID HAVING COUNT(DISTINCT COUNTRY_CODE)>1 "
+        "AND NOT EXISTS (SELECT 1 FROM MEMBER_FILE_ID_CONFLICT c WHERE c.ID=candidates.ID);",
+        "INSERT INTO MEMBER_FILE_ID_CONFLICT (ID,COUNTRY_CODES) "
+        f"SELECT ID,ARRAY_AGG(DISTINCT COUNTRY_CODE) FROM ({country_union}) candidates "
+        "GROUP BY ID HAVING COUNT(DISTINCT COUNTRY_CODE)>1 "
+        "AND NOT EXISTS (SELECT 1 FROM MEMBER_FILE_ID_CONFLICT c WHERE c.ID=candidates.ID);",
+        "MERGE INTO MEMBER_FILE_CURRENT_OWNER o USING ("
+        f"SELECT ID,MIN(COUNTRY_CODE) AS COUNTRY_CODE FROM ({country_union}) existing "
+        "WHERE NOT EXISTS (SELECT 1 FROM MEMBER_FILE_ID_CONFLICT c WHERE c.ID=existing.ID) "
+        "GROUP BY ID HAVING COUNT(DISTINCT COUNTRY_CODE)=1) s ON o.ID=s.ID "
+        "WHEN NOT MATCHED THEN INSERT (ID,COUNTRY_CODE,LAST_BATCH_ID,UPDATED_AT) "
+        "VALUES (s.ID,s.COUNTRY_CODE,'LEGACY_SEED',CURRENT_TIMESTAMP());",
+        "MERGE INTO MEMBER_FILE_CURRENT_OWNER o USING ("
+        "SELECT ID,COUNTRY_CODE,BATCH_ID FROM MEMBER_FILE_STAGING "
+        f"WHERE BATCH_ID={_sql_string(batch_id)} "
+        "QUALIFY ROW_NUMBER() OVER(PARTITION BY ID ORDER BY INGEST_DATE DESC,SOURCE_FILE DESC,SOURCE_ROW_NUMBER DESC)=1) s "
+        "ON o.ID=s.ID WHEN MATCHED AND NOT EXISTS (SELECT 1 FROM MEMBER_FILE_ID_CONFLICT c WHERE c.ID=s.ID) "
+        "THEN UPDATE SET COUNTRY_CODE=s.COUNTRY_CODE,LAST_BATCH_ID=s.BATCH_ID,UPDATED_AT=CURRENT_TIMESTAMP() "
+        "WHEN NOT MATCHED AND NOT EXISTS (SELECT 1 FROM MEMBER_FILE_ID_CONFLICT c WHERE c.ID=s.ID) "
+        "THEN INSERT (ID,COUNTRY_CODE,LAST_BATCH_ID,UPDATED_AT) VALUES (s.ID,s.COUNTRY_CODE,s.BATCH_ID,CURRENT_TIMESTAMP());",
+    ])
+    statements.extend(country_merges)
+    for country in countries:
+        statements.append(
+            f"DELETE FROM MEMBER_{country} t WHERE EXISTS (SELECT 1 FROM MEMBER_FILE_CURRENT_OWNER o "
+            f"WHERE o.ID=t.ID AND o.COUNTRY_CODE<>'{country}') "
+            "AND NOT EXISTS (SELECT 1 FROM MEMBER_FILE_ID_CONFLICT c WHERE c.ID=t.ID);"
         )
     if result.rejects:
         rejected_rows = []
@@ -523,4 +602,22 @@ def generate_snowflake_load_sql(result: IngestionResult, output_file: Path, data
         statements.append(f"SELECT '{table}' AS TARGET_TABLE, COUNT(*) AS ROW_COUNT, COUNT_IF(DOB IS NULL) AS NULL_DOB_ROWS, COUNT_IF(STALE_MEMBER) AS STALE_ROWS FROM {table} WHERE INGEST_DATE=TO_DATE('{result.ingested_on.isoformat()}');")
     statements.append(f"SELECT COUNTRY_CODE,SOURCE_FILE,SOURCE_ROW_NUMBER,REASON_CODE,REASON_DETAIL FROM FILE_DQ_REJECT WHERE BATCH_ID={_sql_string(batch_id)} ORDER BY SOURCE_FILE,SOURCE_ROW_NUMBER;")
     statements.append(f"SELECT COUNTRY_CODE,SOURCE_FILE,SOURCE_HEADERS,MISSING_STANDARD_COLUMNS,ROWS_READ,ROWS_ACCEPTED,ROWS_REJECTED FROM FILE_SCHEMA_AUDIT WHERE BATCH_ID={_sql_string(batch_id)} ORDER BY SOURCE_FILE;")
+    statements.append(
+        f"SELECT 'LANDING' AS LAYER,COUNT(*) AS ROW_COUNT FROM MEMBER_FILE_LANDING WHERE BATCH_ID={_sql_string(batch_id)} "
+        f"UNION ALL SELECT 'STAGING',COUNT(*) FROM MEMBER_FILE_STAGING WHERE BATCH_ID={_sql_string(batch_id)};"
+    )
+    statements.append(
+        "SELECT ID,COUNT(DISTINCT COUNTRY_CODE) AS COUNTRY_COUNT FROM (" + stage_union + ") batch_members "
+        "GROUP BY ID HAVING COUNT(DISTINCT COUNTRY_CODE)>1 ORDER BY ID;"
+    )
+    statements.append("SELECT ID,COUNTRY_CODES FROM MEMBER_FILE_ID_CONFLICT ORDER BY ID;")
+    statements.append(
+        f"SELECT STATUS,ROWS_READ,ROWS_ACCEPTED,ROWS_REJECTED FROM ETL_BATCH_AUDIT WHERE BATCH_ID={_sql_string(batch_id)};"
+    )
+    statements.append(
+        "SELECT target_name, row_count FROM (" + " UNION ALL ".join(
+            f"SELECT '{country}' AS target_name,COUNT(*) AS row_count FROM MEMBER_{country}"
+            for country in countries
+        ) + ") ORDER BY target_name;"
+    )
     output_file.write_text("\n\n".join(statements) + "\n", encoding="utf-8")

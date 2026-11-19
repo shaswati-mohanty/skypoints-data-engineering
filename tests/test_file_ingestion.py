@@ -2,6 +2,9 @@ import csv
 from datetime import date
 import json
 from pathlib import Path
+import sys
+
+import pytest
 
 from skypoints_etl.file_ingestion import (
     STANDARD_COLUMNS,
@@ -10,6 +13,7 @@ from skypoints_etl.file_ingestion import (
     inspect_schema,
     infer_country_code,
 )
+from skypoints_etl.ingest_cli import main as ingest_main
 
 
 def write_csv(path: Path, headers: list[str], rows: list[list[str]]) -> None:
@@ -57,6 +61,24 @@ def test_ingests_aliases_and_routes_invalid_date_to_rejects(tmp_path: Path):
         normalized = list(csv.DictReader(stream))
     assert tuple(normalized[0]) == STANDARD_COLUMNS
     assert normalized[0]["ENROLLMENT_DATE"] == "2022-05-11"
+
+
+def test_ingests_pipe_header_and_detail_records_and_rejects_wrong_width(tmp_path: Path):
+    source = tmp_path / "IND_members.dat"
+    source.write_text(
+        "|H|Member_Name|Member_Id|Enrollment_Date|Last_Flight_Date|Tier_Code|Agent_Name|State|Country|DOB|Is_Active\n"
+        "|D|Ravi|223458|20101012|20121013|SLV|Sam|TN|IND|03051985|A\n"
+        "|D|Broken|223459|20101012|20121013|GLD|Sam|NCR|IND|03051985\n",
+        encoding="utf-8",
+    )
+    result = ingest_csv_files([source], tmp_path / "out", date(2026, 11, 20))
+    assert len(result.accepted_by_country["IND"]) == 1
+    member = result.accepted_by_country["IND"][0]
+    assert member["ID"] == "223458"
+    assert member["DOB"] == date(1985, 3, 5)
+    assert member["FLIGHT_DATE"] == date(2012, 10, 13)
+    assert len(result.rejects) == 1
+    assert "detail has 9 fields; header declares 10" in result.rejects[0]["REASON_DETAIL"]
 
 
 def test_missing_optional_columns_are_null_and_tier_corp_are_normalized(tmp_path: Path):
@@ -114,6 +136,10 @@ def test_snowflake_script_has_typed_dates_staging_and_reject_load(tmp_path: Path
     assert "INSERT INTO FILE_SCHEMA_AUDIT" in sql
     assert "FILE_DQ_REJECT" in sql and "2021-13-13" in sql
     assert "O''Neil" in sql
+    assert "CLUSTER BY (COUNTRY_CODE,BATCH_ID,ID)" in sql
+    assert "MEMBER_FILE_CURRENT_OWNER" in sql
+    assert "MEMBER_FILE_ID_CONFLICT" in sql
+    assert "DELETE FROM MEMBER_AUS" in sql
 
 
 def test_agent_and_post_code_are_retained_in_sql_normalization(tmp_path: Path):
@@ -144,3 +170,24 @@ def test_content_hash_makes_batch_id_stable_but_changes_when_file_changes(tmp_pa
     assert first.batch_id == replay.batch_id
     assert first.batch_id != next_day.batch_id
     assert first.batch_id != corrected.batch_id
+
+
+def test_reject_rate_circuit_breaker_skips_executable_sql(tmp_path: Path, monkeypatch):
+    source = tmp_path / "USA.csv"
+    write_csv(source, ["ID", "Name", "EnrollmentDate"], [
+        ["1", "Accepted", "2022-05-11"],
+        ["2", "Rejected", "2021-13-13"],
+    ])
+    output = tmp_path / "out"
+    monkeypatch.setattr(sys, "argv", [
+        "skypoints-ingest", "--input-files", str(source), "--output-dir", str(output),
+        "--ingested-on", "2026-11-20", "--max-reject-rate", "0.20",
+    ])
+    with pytest.raises(SystemExit) as exit_info:
+        ingest_main()
+    assert exit_info.value.code == 2
+    manifest = json.loads((output / "ingestion_manifest_20261120.json").read_text(encoding="utf-8"))
+    assert manifest["circuit_breaker"] == "TRIPPED"
+    assert manifest["reject_rate"] == 0.5
+    assert (output / "rejects_20261120.csv").exists()
+    assert not (output / "snowflake_load_20261120.sql").exists()
