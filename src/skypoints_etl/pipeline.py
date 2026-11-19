@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -28,6 +29,23 @@ def parse_date(value: Any) -> date | None:
     if value is None or str(value).strip().upper() in ("", "NULL", "NONE"):
         return None
     raw = str(value).strip()
+    # Accept YYYYMMDD and unpadded US dates such as 6152022 / 3051985.
+    if re.fullmatch(r"\d{7,8}", raw):
+        if len(raw) == 8 and 1900 <= int(raw[:4]) <= 2100:
+            try:
+                return datetime.strptime(raw, "%Y%m%d").date()
+            except ValueError:
+                pass
+        year, digits = int(raw[-4:]), raw[:-4]
+        for month_width in (1, 2):
+            day_width = len(digits) - month_width
+            if day_width not in (1, 2):
+                continue
+            try:
+                return date(year, int(digits[:month_width]), int(digits[month_width:]))
+            except ValueError:
+                continue
+        raise ValueError(f"invalid date: {raw}")
     for fmt in DATE_FORMATS:
         try:
             return datetime.strptime(raw, fmt).date()
@@ -49,12 +67,20 @@ def _records(path: Path) -> list[dict[str, str]]:
             header = None; out = []
             for line_no, line in enumerate(f, 1):
                 parts = line.rstrip("\r\n").split("|")
-                parts = [x for x in parts if x != ""]
+                if parts and parts[0] == "":
+                    parts = parts[1:]
+                if parts and parts[-1] == "":
+                    parts = parts[:-1]
                 if not parts: continue
                 kind, *values = parts
-                if kind == "H": header = values; continue
+                if kind == "H":
+                    header = values
+                    continue
                 if kind != "D" or header is None:
                     out.append({"__error": f"line {line_no}: detail before header or unknown record type"}); continue
+                if len(values) != len(header):
+                    out.append({"__error": f"line {line_no}: expected {len(header)} fields, received {len(values)}"})
+                    continue
                 out.append(dict(zip(header, values)))
             return out
         return list(csv.DictReader(f))
@@ -71,6 +97,16 @@ def normalize_member(raw: dict[str, str], as_of: date) -> dict[str, Any]:
         raise ValueError("missing mandatory member_name, member_id, country, or enrollment_date")
     if len(name) > 255 or len(member_id) > 18 or len(country) > 5:
         raise ValueError("field exceeds declared length")
+    tier_code = get("tier_code")
+    if tier_code and tier_code.upper() not in ("PLT", "SLV", "GLD"):
+        raise ValueError("invalid tier_code; expected PLT, SLV, or GLD")
+    agent_name, state, postcode = get("agent_name"), get("state"), get("postcode")
+    if agent_name and len(agent_name) > 255:
+        raise ValueError("agent_name exceeds 255 characters")
+    if state and len(state) > 5:
+        raise ValueError("state exceeds 5 characters")
+    if postcode and (not postcode.isdigit() or len(postcode) > 5):
+        raise ValueError("postcode must be a non-negative integer of at most 5 digits")
     if enroll > as_of or (flight and flight > as_of) or (dob and dob > as_of):
         raise ValueError("date is in the future")
     if dob and dob > enroll: raise ValueError("DOB is after enrollment date")
@@ -78,9 +114,9 @@ def normalize_member(raw: dict[str, str], as_of: date) -> dict[str, Any]:
     if active and active.upper() not in ("A", "I", "Y", "N", "1", "0"): raise ValueError("invalid active flag")
     age = as_of.year - dob.year - ((as_of.month, as_of.day) < (dob.month, dob.day)) if dob else None
     return {"member_name": name, "member_id": member_id, "enrollment_date": enroll.isoformat(),
-            "last_flight_date": flight.isoformat() if flight else None, "tier_code": get("tier_code"),
-            "agent_name": get("agent_name"), "state": get("state"), "country": COUNTRY_CODES.get(country.upper(), country.upper()),
-            "postcode": get("postcode"), "dob": dob.isoformat() if dob else None, "is_active": active.upper() if active else None,
+            "last_flight_date": flight.isoformat() if flight else None, "tier_code": tier_code.upper() if tier_code else None,
+            "agent_name": agent_name or None, "state": state or None, "country": COUNTRY_CODES.get(country.upper(), country.upper()),
+            "postcode": int(postcode) if postcode else None, "dob": dob.isoformat() if dob else None, "is_active": active.upper() if active else None,
             "age": age, "stale_member": bool(flight and (as_of-flight).days > 90), "source_updated_at": as_of.isoformat()}
 
 def normalize_redemption_payload(payload: Any, as_of: date) -> list[dict[str, Any]]:
@@ -115,16 +151,44 @@ def run_pipeline(member_rows: Iterable[dict[str, str]], redemption_payload: Any,
             record["source_sequence"] = row_num
             existing = by_id.get(record["member_id"])
             if existing:
-                # Feed order is source order. Equal-date conflicting records are ambiguous and rejected.
-                if record["source_updated_at"] == existing["source_updated_at"] and record == existing:
-                    continue
+                rejects.append({
+                    "feed": "member", "row": row_num,
+                    "reason": f"duplicate member_id {record['member_id']!r}; later source row supersedes earlier row",
+                    "record": json.dumps(raw, default=str),
+                })
             by_id[record["member_id"]] = record
         except (ValueError, TypeError) as exc:
             rejects.append({"feed": "member", "row": row_num, "reason": str(exc), "record": json.dumps(raw, default=str)})
-    try:
-        transactions = normalize_redemption_payload(redemption_payload, business_date)
-    except (ValueError, TypeError) as exc:
-        transactions = []; rejects.append({"feed": "redemption", "row": None, "reason": str(exc), "record": ""})
+    transactions = []
+    feeds = redemption_payload if isinstance(redemption_payload, list) else [redemption_payload]
+    for feed_index, feed in enumerate(feeds, 1):
+        try:
+            if not isinstance(feed, dict):
+                raise ValueError("feed entry must be an object")
+            member_id = str(feed.get("member_id", "")).strip()
+            feed_date = parse_date(feed.get("feed_date"))
+            if not member_id or feed_date is None:
+                raise ValueError("missing member_id or feed_date")
+            if feed_date > business_date:
+                raise ValueError("feed_date is in the future")
+            redemptions = feed.get("redemptions", [])
+            if not isinstance(redemptions, list):
+                raise ValueError("redemptions must be an array")
+        except (ValueError, TypeError) as exc:
+            rejects.append({"feed": "redemption", "row": feed_index, "reason": str(exc), "record": json.dumps(feed, default=str)})
+            continue
+        for txn_index, txn in enumerate(redemptions, 1):
+            try:
+                transactions.extend(normalize_redemption_payload({
+                    "member_id": member_id,
+                    "feed_date": feed_date.isoformat(),
+                    "redemptions": [txn],
+                }, business_date))
+            except (ValueError, TypeError) as exc:
+                rejects.append({
+                    "feed": "redemption", "row": f"{feed_index}:{txn_index}",
+                    "reason": str(exc), "record": json.dumps(txn, default=str),
+                })
     seen = set(); unique = []
     for txn in transactions:
         if txn["txn_id"] in seen:
@@ -133,5 +197,15 @@ def run_pipeline(member_rows: Iterable[dict[str, str]], redemption_payload: Any,
     return Result(list(by_id.values()), unique, rejects)
 
 def process_files(member_path: Path, redemption_path: Path, as_of: str) -> Result:
-    rows = _records(member_path); payload = json.loads(redemption_path.read_text(encoding="utf-8-sig"))
+    rows = _records(member_path)
+    try:
+        payload = json.loads(redemption_path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        result = run_pipeline(rows, [], as_of)
+        result.rejects.append({
+            "feed": "redemption", "row": None,
+            "reason": f"unable to read/parse JSON feed: {exc}",
+            "record": "",
+        })
+        return result
     return run_pipeline(rows, payload, as_of)

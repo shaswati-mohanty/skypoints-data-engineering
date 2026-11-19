@@ -18,11 +18,17 @@ def main() -> None:
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     result = process_files(args.members, args.redemptions, args.as_of)
-    for name, rows in (("members.csv", result.members), ("redemptions.csv", result.redemptions), ("rejects.csv", result.rejects)):
+    outputs = (
+        ("members.csv", result.members, ("member_name", "member_id", "enrollment_date", "last_flight_date", "tier_code", "agent_name", "state", "country", "postcode", "dob", "is_active", "age", "stale_member", "source_updated_at", "source_sequence")),
+        ("redemptions.csv", result.redemptions, ("txn_id", "member_id", "feed_date", "txn_date", "partner", "miles_redeemed", "status")),
+        ("rejects.csv", result.rejects, ("feed", "row", "reason", "record")),
+    )
+    for name, rows, empty_fields in outputs:
         with (args.out / name).open("w", newline="", encoding="utf-8") as f:
-            if rows:
-                writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-                writer.writeheader(); writer.writerows(rows)
+            fieldnames = list(dict.fromkeys(key for row in rows for key in row)) or list(empty_fields)
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
     print(json.dumps({"members": len(result.members), "redemptions": len(result.redemptions), "rejects": len(result.rejects)}))
 
 if __name__ == "__main__":
