@@ -10,7 +10,7 @@ Redemptions follow `raw VARIANT -> LATERAL FLATTEN -> transaction fact`; transac
 
 ## Input contract
 
-CSV headers are mapped by aliases, or pipe records use `|H|...` followed by `|D|...`. Dates accepted by Python: `YYYYMMDD`, ISO, US slash dates and `MMDDYYYY`. The assessment's 8-character date fields are ambiguous (`03051985`): this solution interprets DOB as `MMDDYYYY`, and enrollment/flight dates as `YYYYMMDD`. Change the configured contract if the source confirms another format. Country aliases normalize US/IN/AU/PHIL; unknown values are preserved and should be reviewed. Missing optional DOB/flight is allowed; invalid supplied dates are rejected. Key is `member_id`; duplicate rows in a batch resolve in source order (last valid row wins). Across batches, use a source effective timestamp/sequence in production, not arrival order. The sample has no source update timestamp, so batch business date and file/row order are documented tie-breakers.
+CSV headers are mapped by aliases, or pipe records use `|H|...` followed by `|D|...`. Empty pipe fields are preserved and rows with the wrong number of fields are rejected. Dates accepted by Python: `YYYYMMDD`, unpadded `MMDDYYYY` (such as `6152022`), ISO, and US slash dates. The assessment's date fields are ambiguous (`03051985`): DOB is interpreted as `MMDDYYYY`; enrollment and flight dates prefer `YYYYMMDD`. Country aliases normalize US/IN/AU/PHIL; unknown values require an approved country mapping. Missing optional DOB/flight is allowed; invalid supplied dates are rejected. Key is `member_id`; duplicate rows in a batch resolve in source order (last valid row wins) and the superseded row is recorded in rejects. Cross-batch ordering requires a source effective timestamp/sequence.
 
 ## Run
 
@@ -22,9 +22,9 @@ python -m pytest
 
 ### Country-coded member CSV files
 
-The `skypoints-ingest` command recognizes a country code at the start of a filename or as a delimited filename token. `US`, `IN`, and `AU` normalize to `USA`, `IND`, and `AUS`. It maps common header variants into `ID, MEMBER_NAME, DOB, TIER_CODE, ENROLLMENT_DATE, IND_CORP, FLIGHT_DATE`; missing optional columns are emitted as blank values and recorded in a JSON schema manifest. Dates in the output CSVs use ISO `YYYY-MM-DD`; Snowflake columns use `DATE`.
+The `skypoints-ingest` command recognizes a country code at the start of a filename or as a delimited filename token. `US`, `IN`, and `AU` normalize to `USA`, `IND`, and `AUS`. It maps common header variants into `ID, MEMBER_NAME, DOB, TIER_CODE, ENROLLMENT_DATE, IND_CORP, FLIGHT_DATE`; missing optional columns are emitted as blank values and recorded in a JSON schema manifest. Source `Agent_Name` and `Post Code` are retained in the Snowflake raw and typed staging/target tables, while the canonical CSV remains the requested seven-column schema. Dates in the output CSVs use ISO `YYYY-MM-DD`; Snowflake columns use `DATE`.
 
-Rows with missing required IDs/names, invalid supplied dates, unsupported tier values, conflicting row/file countries, or duplicate IDs within one file are written to the dated reject CSV. Accepted rows are written to `COUNTRY_members_YYYYMMDD.csv`. The command also generates Snowflake SQL to persist raw rows, normalized staging rows, schema inspection, rejects, and per-country member tables. It computes age and the `> 90` day stale flag using the ingestion date.
+Rows with missing required ID/name/enrollment date, invalid supplied dates, unsupported tier values, out-of-range post codes, conflicting row/file countries, or duplicate IDs within one file are written to the dated reject CSV. Accepted rows are written to `COUNTRY_members_YYYYMMDD.csv`. The command also generates a content-hash batch ID, a batch audit row, and Snowflake SQL to persist raw rows, normalized staging rows, schema inspection, rejects, and per-country member tables. It computes age and the `> 90` day stale flag using the ingestion date. The generated row-literal SQL is for small local assessment files; use the staged `COPY INTO` pattern for production-sized feeds.
 
 ```powershell
 $env:PYTHONPATH = 'src'
@@ -34,9 +34,9 @@ python -m skypoints_etl.ingest_cli `
   --database SNOWFLAKE_LEARNING_DB --schema SKYPOINTS
 ```
 
-Review the generated manifest and rejects before running the generated `snowflake_load_YYYYMMDD.sql` in the intended Snowflake development schema. Filename country mapping is used only when the member row has no country column; if a country field is present, it must agree with the filename. The sample CSV IDs repeat across countries, so country tables keep IDs scoped to their table. Global country-move resolution requires a globally unique member ID and an authoritative source update timestamp/sequence.
+Review the generated manifest and rejects before running the generated `snowflake_load_YYYYMMDD.sql` in the intended Snowflake development schema. Its files and row-level operations are idempotent for an identical content-hash batch, assuming serialized execution. Filename country mapping is used only when the member row has no country column; if a country field is present, it must agree with the filename. The supplied sample CSV IDs repeat across countries, so this file loader keeps IDs scoped to each country table. Global country-move resolution in `sql/02_transform.sql` requires a globally unique member ID and an authoritative source update timestamp/sequence.
 
-No database credentials are needed to run the local Python reference. Apply `sql/01_ddl.sql` and `sql/02_transform.sql` in a Snowflake development schema after setting batch/date variables and adapting country target creation to the approved country catalog. Target routing must be allow-listed and generated with safely quoted identifiers; do not interpolate untrusted source values into SQL.
+No database credentials are needed to run the local Python reference. Run `python -m skypoints_etl.ingest_cli ...` and inspect `outputs/ingested/`: accepted country CSVs, `rejects_YYYYMMDD.csv`, `ingestion_manifest_YYYYMMDD.json`, and `snowflake_load_YYYYMMDD.sql`. The generic CLI writes `members.csv`, `redemptions.csv`, and `rejects.csv` to the directory passed through `--out`. Apply `sql/01_ddl.sql` and `sql/02_transform.sql` in a Snowflake development schema after setting the content-hash batch and business date. The generic SQL country allow-list currently contains USA/IND/AUS and must be expanded from an approved country catalog before global deployment.
 
 ## Data quality coverage
 

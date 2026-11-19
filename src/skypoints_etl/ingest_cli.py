@@ -24,6 +24,7 @@ def main() -> None:
     generate_snowflake_load_sql(result, sql_path, args.database, args.schema)
     print(json.dumps({
         "ingested_on": args.ingested_on.isoformat(),
+        "batch_id": result.batch_id,
         "accepted_rows": sum(len(rows) for rows in result.accepted_by_country.values()),
         "rejected_rows": len(result.rejects),
         "targets": {f"MEMBER_{country}": len(rows) for country, rows in sorted(result.accepted_by_country.items())},

@@ -107,6 +107,40 @@ def test_snowflake_script_has_typed_dates_staging_and_reject_load(tmp_path: Path
     assert "TRY_TO_DATE(l.NORMALIZED_RECORD:ENROLLMENT_DATE::VARCHAR)" in sql
     assert "CREATE TABLE IF NOT EXISTS FILE_DQ_REJECT" in sql
     assert "CREATE TABLE IF NOT EXISTS FILE_SCHEMA_AUDIT" in sql
+    assert "CREATE TABLE IF NOT EXISTS ETL_BATCH_AUDIT" in sql
+    assert "BEGIN TRANSACTION;" in sql and "COMMIT;" in sql
+    assert "SOURCE_SHA256" in sql and "CONTENT_SHA256" in sql
+    assert "AGENT_NAME" in sql and "POST_CODE" in sql
     assert "INSERT INTO FILE_SCHEMA_AUDIT" in sql
     assert "FILE_DQ_REJECT" in sql and "2021-13-13" in sql
     assert "O''Neil" in sql
+
+
+def test_agent_and_post_code_are_retained_in_sql_normalization(tmp_path: Path):
+    source = tmp_path / "IND_members.csv"
+    write_csv(source, ["ID", "Name", "Enrollment Date", "Agent Name", "Post Code"], [
+        ["1", "Ravi", "2022-05-11", "Agent Rao", "56001"],
+    ])
+    result = ingest_csv_files([source], tmp_path / "out", date(2026, 11, 20))
+    row = result.accepted_by_country["IND"][0]
+    assert row["AGENT_NAME"] == "Agent Rao"
+    assert row["POST_CODE"] == "56001"
+    sql_path = tmp_path / "load.sql"
+    generate_snowflake_load_sql(result, sql_path, "SNOWFLAKE_LEARNING_DB", "SKYPOINTS")
+    sql = sql_path.read_text(encoding="utf-8")
+    assert '"AGENT_NAME": "Agent Rao"' in sql
+    assert '"POST_CODE": "56001"' in sql
+
+
+def test_content_hash_makes_batch_id_stable_but_changes_when_file_changes(tmp_path: Path):
+    source = tmp_path / "USA_members.csv"
+    headers = ["ID", "Name", "EnrollmentDate"]
+    write_csv(source, headers, [["1", "First", "2022-05-11"]])
+    first = ingest_csv_files([source], tmp_path / "out1", date(2026, 11, 20))
+    replay = ingest_csv_files([source], tmp_path / "out2", date(2026, 11, 20))
+    next_day = ingest_csv_files([source], tmp_path / "out4", date(2026, 11, 21))
+    write_csv(source, headers, [["1", "Corrected", "2022-05-11"]])
+    corrected = ingest_csv_files([source], tmp_path / "out3", date(2026, 11, 20))
+    assert first.batch_id == replay.batch_id
+    assert first.batch_id != next_day.batch_id
+    assert first.batch_id != corrected.batch_id

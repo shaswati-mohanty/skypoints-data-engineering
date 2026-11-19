@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "skypoints-etl"
 version = "0.1.0"
@@ -15,3 +19,6 @@ skypoints-ingest = "skypoints_etl.ingest_cli:main"
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
